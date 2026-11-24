@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+.idea/
+.vscode/
+*.log
+.env
+.DS_Store
+models/*.task
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/

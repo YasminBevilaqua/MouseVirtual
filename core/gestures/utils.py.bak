@@ -1,0 +1,162 @@
+﻿
+"""Shared landmark geometry helpers used by all gesture processors."""
+
+import math
+import numpy as np
+from core.tracker import Landmark
+
+
+def dist3d(a: Landmark, b: Landmark) -> float:
+    """3D Euclidean distance in normalized MediaPipe coordinates."""
+    return float(np.linalg.norm([a.x - b.x, a.y - b.y, a.z - b.z]))
+
+
+def _distance2d(a: Landmark, b: Landmark) -> float:
+    return math.hypot(a.x - b.x, a.y - b.y)
+
+
+def _angle(a: Landmark, b: Landmark, c: Landmark) -> float:
+    """Angle ABC in degrees, calculated in image coordinates."""
+    v1 = np.array([a.x - b.x, a.y - b.y], dtype=float)
+    v2 = np.array([c.x - b.x, c.y - b.y], dtype=float)
+
+    denominator = np.linalg.norm(v1) * np.linalg.norm(v2)
+    if denominator < 1e-8:
+        return 0.0
+
+    cosine = float(np.dot(v1, v2) / denominator)
+    cosine = max(-1.0, min(1.0, cosine))
+    return math.degrees(math.acos(cosine))
+
+
+def _finger_angle(
+    lm: list[Landmark],
+    mcp: int,
+    pip: int,
+    dip: int,
+) -> float:
+    """Joint angle: near 180 degrees means the finger is straight."""
+    return _angle(lm[mcp], lm[pip], lm[dip])
+
+
+def _finger_extended(
+    lm: list[Landmark],
+    mcp: int,
+    pip: int,
+    dip: int,
+) -> bool:
+    return _finger_angle(lm, mcp, pip, dip) >= 150.0
+
+
+def _finger_curled(
+    lm: list[Landmark],
+    mcp: int,
+    pip: int,
+    dip: int,
+) -> bool:
+    return _finger_angle(lm, mcp, pip, dip) <= 135.0
+
+
+def _palm_width(lm: list[Landmark]) -> float:
+    return max(_distance2d(lm[5], lm[17]), 1e-6)
+
+
+
+def _thumb_curled(lm: list[Landmark]) -> bool:
+    """Estimate thumb folding from its joint angle and distance to the palm."""
+    thumb_angle = _angle(lm[2], lm[3], lm[4])
+    width = _palm_width(lm)
+
+    near_palm = min(
+        _distance2d(lm[4], lm[i]) for i in (5, 9, 13)
+    ) < 0.55 * width
+
+    return thumb_angle < 140.0 or near_palm
+
+def pinch_ratio(lm: list[Landmark]) -> float:
+    """Thumb-index distance relative to palm width."""
+    return _distance2d(lm[4], lm[8]) / _palm_width(lm)
+
+def is_extended(tip: Landmark, pip: Landmark) -> bool:
+    """Legacy helper retained for compatibility."""
+    return tip.y < pip.y
+
+
+def is_curled(tip: Landmark, pip: Landmark) -> bool:
+    """Legacy helper retained for compatibility."""
+    return tip.y > pip.y
+
+
+def _finger_states(
+    lm: list[Landmark],
+) -> tuple[list[bool], list[bool]]:
+    joints = [
+        (5, 6, 7),
+        (9, 10, 11),
+        (13, 14, 15),
+        (17, 18, 19),
+    ]
+
+    extended = [_finger_extended(lm, *j) for j in joints]
+    curled = [_finger_curled(lm, *j) for j in joints]
+
+    return extended, curled
+
+
+def is_fist(lm: list[Landmark]) -> bool:
+    """Four fingers curled; allows the thumb to rest outside the fist."""
+    _, curled = _finger_states(lm)
+    return all(curled)
+
+
+def is_peace_sign(lm: list[Landmark]) -> bool:
+    """Index and middle extended; ring, pinky and thumb curled."""
+    extended, curled = _finger_states(lm)
+
+    return (
+        extended[0]
+        and extended[1]
+        and curled[2]
+        and curled[3]
+        and _thumb_curled(lm)
+    )
+
+
+def is_open_palm(lm: list[Landmark]) -> bool:
+    """All four fingers extended and thumb classified as not curled."""
+    extended, _ = _finger_states(lm)
+
+    return all(extended) and not _thumb_curled(lm)
+
+
+def is_v_sign(lm: list[Landmark]) -> bool:
+    """
+    Recognize the V sign using finger joint angles.
+
+    The thumb position is ignored to improve robustness.
+    Index and middle fingers must be extended, while ring and pinky
+    must be curled.
+    """
+    index_angle = _finger_angle(lm, 5, 6, 7)
+    middle_angle = _finger_angle(lm, 9, 10, 11)
+    ring_angle = _finger_angle(lm, 13, 14, 15)
+    pinky_angle = _finger_angle(lm, 17, 18, 19)
+
+    index_extended = index_angle >= 145.0
+    middle_extended = middle_angle >= 145.0
+    ring_curled = ring_angle <= 140.0
+    pinky_curled = pinky_angle <= 140.0
+
+    return (
+        index_extended
+        and middle_extended
+        and ring_curled
+        and pinky_curled
+    )
+
+
+def is_four_fingers(lm: list[Landmark]) -> bool:
+    """Four fingers extended and thumb curled."""
+    extended, _ = _finger_states(lm)
+
+    return all(extended) and _thumb_curled(lm)

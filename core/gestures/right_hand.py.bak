@@ -1,0 +1,265 @@
+
+# core/gestures/right_hand.py
+"""
+Right-hand gesture processor.
+
+Gestures:
+- Thumb + index pinch: left click / drag
+- Thumb + middle pinch: right click
+- Four fingers extended: Win+Tab
+
+The index pinch uses palm-relative distance, hysteresis,
+and consecutive-frame confirmation.
+"""
+
+import time
+import logging
+from enum import Enum, auto
+
+from config import (
+    CAMERA_FPS,
+    THUMB_MIDDLE_CLICK_DIST,
+    PINCH_ENTER_RATIO,
+    PINCH_RELEASE_RATIO,
+    PINCH_CONFIRM_FRAMES,
+    DRAG_HOLD_SECONDS,
+    GESTURE_COOLDOWN_SECONDS,
+    DOUBLE_CLICK_WINDOW_S,
+    ONE_EURO_MINCUTOFF,
+    ONE_EURO_BETA,
+    ONE_EURO_DCUTOFF,
+)
+
+from core.tracker import Landmark
+from core.filter import OneEuroFilter
+from core.display import VirtualDesktop, TrackpadZone, map_to_desktop
+from core.actuator import MouseActuator
+from core.gestures.utils import (
+    dist3d,
+    is_four_fingers,
+    pinch_ratio,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class _State(Enum):
+    IDLE = auto()
+    LEFT_PINCH_PENDING_DRAG = auto()
+    DRAGGING = auto()
+
+
+class RightHandProcessor:
+    """Processes right-hand landmarks on each camera frame."""
+
+    def __init__(
+        self,
+        actuator: MouseActuator,
+        desktop: VirtualDesktop,
+        trackpad: TrackpadZone,
+    ) -> None:
+        self._actuator = actuator
+        self._desktop = desktop
+        self._trackpad = trackpad
+
+        self._state = _State.IDLE
+        self._pinch_start_time: float | None = None
+
+        self._last_click_time = 0.0
+        self._last_gesture_time = 0.0
+
+        self._four_since: float | None = None
+        self._four_fired = False
+
+        # Suavizacao temporal das distancias.
+        self._d_thumb_idx_filtered: float | None = None
+        self._d_thumb_mid_filtered: float | None = None
+
+        # Estados dos pinches.
+        self._thumb_idx_pinching = False
+        self._thumb_mid_pinching = False
+        self._pinch_confirm_frames = 0
+
+        self._filter_x = OneEuroFilter(
+            freq=float(CAMERA_FPS),
+            mincutoff=ONE_EURO_MINCUTOFF,
+            beta=ONE_EURO_BETA,
+            dcutoff=ONE_EURO_DCUTOFF,
+        )
+        self._filter_y = OneEuroFilter(
+            freq=float(CAMERA_FPS),
+            mincutoff=ONE_EURO_MINCUTOFF,
+            beta=ONE_EURO_BETA,
+            dcutoff=ONE_EURO_DCUTOFF,
+        )
+
+    def process(self, landmarks: list[Landmark] | None) -> None:
+        if landmarks is None:
+            # Evita deixar o botao esquerdo pressionado se a mao sumir.
+            if self._state == _State.DRAGGING:
+                self._actuator.drag_end()
+
+            self._state = _State.IDLE
+            self._pinch_start_time = None
+            self._pinch_confirm_frames = 0
+
+            self._thumb_idx_pinching = False
+            self._thumb_mid_pinching = False
+
+            self._d_thumb_idx_filtered = None
+            self._d_thumb_mid_filtered = None
+
+            self._four_since = None
+            self._four_fired = False
+            return
+
+        now = time.perf_counter()
+
+        four_fingers = is_four_fingers(landmarks)
+
+        # Distancias 3D usadas para suavizar e distinguir o clique direito.
+        raw_idx = dist3d(landmarks[4], landmarks[8])
+        raw_mid = dist3d(landmarks[4], landmarks[12])
+
+        alpha = 0.35
+
+        if self._d_thumb_idx_filtered is None:
+            self._d_thumb_idx_filtered = raw_idx
+            self._d_thumb_mid_filtered = raw_mid
+        else:
+            self._d_thumb_idx_filtered += alpha * (
+                raw_idx - self._d_thumb_idx_filtered
+            )
+            self._d_thumb_mid_filtered += alpha * (
+                raw_mid - self._d_thumb_mid_filtered
+            )
+
+        d_thumb_idx = self._d_thumb_idx_filtered
+        d_thumb_mid = self._d_thumb_mid_filtered
+
+        # Pinch indicador normalizado pela largura da palma.
+        # Cinco frames consecutivos sao exigidos para entrar no gesto.
+        ratio = pinch_ratio(landmarks)
+
+        logger.info("Pinça: ratio=%.3f | ativo=%s", ratio, self._thumb_idx_pinching)
+
+        if self._thumb_idx_pinching:
+            if ratio >= PINCH_RELEASE_RATIO:
+                self._thumb_idx_pinching = False
+                self._pinch_confirm_frames = 0
+        else:
+            if ratio <= PINCH_ENTER_RATIO:
+                self._pinch_confirm_frames += 1
+
+                if self._pinch_confirm_frames >= max(
+                    1, PINCH_CONFIRM_FRAMES
+                ):
+                    self._thumb_idx_pinching = True
+                    self._pinch_confirm_frames = 0
+                    logger.debug("Pinch indicador confirmado (ratio=%.3f)", ratio)
+            else:
+                self._pinch_confirm_frames = 0
+
+        # Clique direito: polegar + medio, com verificacao de ambiguidade.
+        middle_is_closer = d_thumb_mid + 0.025 < d_thumb_idx
+
+        if self._thumb_mid_pinching:
+            if d_thumb_mid > 0.075 or not middle_is_closer:
+                self._thumb_mid_pinching = False
+        elif d_thumb_mid < min(THUMB_MIDDLE_CLICK_DIST, 0.050):
+            if middle_is_closer and not self._thumb_idx_pinching:
+                self._thumb_mid_pinching = True
+
+        # Win+Tab: quatro dedos estendidos durante 250 ms.
+        if four_fingers:
+            if self._four_since is None:
+                self._four_since = now
+
+            if (
+                not self._four_fired
+                and now - self._four_since >= 0.25
+                and now - self._last_gesture_time
+                >= GESTURE_COOLDOWN_SECONDS
+            ):
+                self._actuator.win_tab()
+                self._last_gesture_time = now
+                self._four_fired = True
+                logger.debug("Win+Tab: quatro dedos")
+
+            return
+        else:
+            self._four_since = None
+            self._four_fired = False
+
+        # Clique direito.
+        if (
+            self._thumb_mid_pinching
+            and self._state == _State.IDLE
+            and now - self._last_gesture_time
+            >= GESTURE_COOLDOWN_SECONDS
+        ):
+            self._actuator.right_click()
+            self._last_gesture_time = now
+            logger.debug("Clique direito (d=%.4f)", d_thumb_mid)
+            return
+
+        thumb_idx_pinch = self._thumb_idx_pinching
+
+        # Maquina de estados para clique esquerdo e arraste.
+        if self._state == _State.IDLE:
+            if thumb_idx_pinch:
+                self._state = _State.LEFT_PINCH_PENDING_DRAG
+                self._pinch_start_time = now
+
+        elif self._state == _State.LEFT_PINCH_PENDING_DRAG:
+            if not thumb_idx_pinch:
+                # Soltou antes do tempo de arraste: clique.
+                if (
+                    now - self._last_gesture_time
+                    >= GESTURE_COOLDOWN_SECONDS
+                ):
+                    if (
+                        self._last_click_time > 0
+                        and now - self._last_click_time
+                        <= DOUBLE_CLICK_WINDOW_S
+                    ):
+                        self._actuator.double_click()
+                        self._last_click_time = 0.0
+                        logger.debug("Duplo clique")
+                    else:
+                        self._actuator.left_click()
+                        self._last_click_time = now
+                        logger.debug("Clique esquerdo")
+
+                    self._last_gesture_time = now
+
+                self._state = _State.IDLE
+                self._pinch_start_time = None
+
+            elif (
+                self._pinch_start_time is not None
+                and now - self._pinch_start_time >= DRAG_HOLD_SECONDS
+            ):
+                self._actuator.drag_start()
+                self._state = _State.DRAGGING
+                logger.debug("Inicio do arraste")
+
+        elif self._state == _State.DRAGGING:
+            if not thumb_idx_pinch:
+                self._actuator.drag_end()
+                self._state = _State.IDLE
+                self._pinch_start_time = None
+                logger.debug("Fim do arraste")
+
+        # Movimento do cursor.
+        filtered_x = self._filter_x(landmarks[8].x, now)
+        filtered_y = self._filter_y(landmarks[8].y, now)
+
+        screen_x, screen_y = map_to_desktop(
+            filtered_x,
+            filtered_y,
+            self._trackpad,
+            self._desktop,
+        )
+
+        self._actuator.move(screen_x, screen_y)
